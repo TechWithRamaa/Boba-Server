@@ -8,85 +8,49 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <cstring>
-#include <functional>
-#include <queue>
-#include <mutex>
-#include <condition_variable>
-#include <array>
+#include "ctpl_stl.h" // Include CTPL thread pool library
 
 const int MAX_EVENTS = 10;
 const int PORT = 8080;
 const int BACKLOG = 128;
-const int BUFFER_SIZE = 1024;
+const int TIMEOUT = 5000; // 5 seconds
 
-// Thread pool to manage worker threads
-class ThreadPool {
-public:
-    ThreadPool(size_t numThreads);
-    ~ThreadPool();
-    void enqueue(std::function<void()> task);
-
-private:
-    std::vector<std::thread> workers;
-    std::queue<std::function<void()>> tasks;
-    std::mutex queueMutex;
-    std::condition_variable condition;
-    bool stop;
-};
-
-ThreadPool::ThreadPool(size_t numThreads) : stop(false) {
-    for (size_t i = 0; i < numThreads; ++i) {
-        workers.emplace_back([this] {
-            while (true) {
-                std::function<void()> task;
-                {
-                    std::unique_lock<std::mutex> lock(this->queueMutex);
-                    this->condition.wait(lock, [this] {
-                        return this->stop || !this->tasks.empty();
-                    });
-                    if (this->stop && this->tasks.empty()) return;
-                    task = std::move(this->tasks.front());
-                    this->tasks.pop();
-                }
-                task();
-            }
-        });
-    }
-}
-
-ThreadPool::~ThreadPool() {
-    {
-        std::unique_lock<std::mutex> lock(queueMutex);
-        stop = true;
-    }
-    condition.notify_all();
-    for (std::thread &worker : workers) worker.join();
-}
-
-void ThreadPool::enqueue(std::function<void()> task) {
-    {
-        std::unique_lock<std::mutex> lock(queueMutex);
-        if (stop) throw std::runtime_error("enqueue on stopped ThreadPool");
-        tasks.push(std::move(task));
-    }
-    condition.notify_one();
-}
-
-// Utility to set a socket to non-blocking mode
+// Utility function to set a socket to non-blocking mode
 void setNonBlocking(int sockfd) {
     int flags = fcntl(sockfd, F_GETFL, 0);
     fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
 }
 
-// Function to send HTTP response
-void sendHttpResponse(int client_fd, const std::string &content) {
-    std::string response = "HTTP/1.1 200 OK\r\n";
-    response += "Content-Type: text/plain\r\n";
-    response += "Content-Length: " + std::to_string(content.size()) + "\r\n";
-    response += "Connection: close\r\n\r\n";
-    response += content;
+// Function to create a listening socket
+int createSocket() {
+    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd == -1) {
+        std::cerr << "Failed to create socket" << std::endl;
+        return -1;
+    }
 
-    send(client_fd, response.c_str(), response.size(), 0);
+    int opt = 1;
+    setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY; // Listen on all interfaces
+    addr.sin_port = htons(PORT);
+
+    if (bind(sockfd, (sockaddr*)&addr, sizeof(addr)) == -1) {
+        std::cerr << "Bind failed" << std::endl;
+        close(sockfd);
+        return -1;
+    }
+
+    if (listen(sockfd, BACKLOG) == -1) {
+        std::cerr << "Listen failed" << std::endl;
+        close(sockfd);
+        return -1;
+    }
+
+    setNonBlocking(sockfd);
+    return sockfd;
 }
 
 // Function to execute a shell command and return its output
@@ -117,199 +81,112 @@ std::string executeCommand(const std::string &cmd) {
     return result;
 }
 
-// Function to handle a single client connection
+
+// Function to handle client communication
 void handleClient(int client_fd) {
-    char buffer[BUFFER_SIZE] = {0};
-    std::string username, password;
-    // Authentication flow
-    ssize_t bytes_read;
-    std::cout << "Waiting to receive username" << std::endl;
+    char readBuffer[1024];
+    char writeBuffer[4096];
 
-    // Receive username
     while (true) {
-        bytes_read = recv(client_fd, buffer, BUFFER_SIZE, 0);
-        if (bytes_read == -1) {
-            if (errno == EWOULDBLOCK || errno == EAGAIN) {
-                // No data available yet, continue waiting
-                continue;
-            } else {
-                std::cerr << "Failed to receive username" << std::endl;
-                close(client_fd);
-                return;
-            }
+        memset(readBuffer, 0, sizeof(readBuffer));
+        memset(writeBuffer, 0, sizeof(readBuffer));
+
+        ssize_t bytes_received = recv(client_fd, readBuffer, sizeof(readBuffer) - 1, 0);
+
+        if (bytes_received > 0) {
+            readBuffer[bytes_received] = '\0';
+            std::string command(readBuffer);
+            std::cout << "Received from client (Socket FD: " << client_fd << ") - : " << command << std::endl;
+
+            // Check for termination message
+            if (command.find("q") != std::string::npos) {
+                std::cout << "Client requested to close the connection." << std::endl;
+                break;
+            } 
+            std::string response = executeCommand(command);
+            strncpy(writeBuffer, response.c_str(), sizeof(writeBuffer) - 1); 
+            send(client_fd, writeBuffer, strlen(writeBuffer), 0);
+        } else if (bytes_received == 0) {
+            // Client closed the connection
+            std::cout << "Client disconnected." << std::endl;
+            break;
+        } else if (errno != EWOULDBLOCK && errno != EAGAIN) {
+            std::cerr << "Recv error occurred!" << std::endl;
+            break;
         }
-        if (bytes_read == 0) {
-            std::cerr << "Connection closed" << std::endl;
-            close(client_fd);
-            return;
-        }
-        buffer[bytes_read] = '\0';
-        username = buffer;
-        break; // Username received successfully
     }
-
-    std::cout << "Waiting to receive password" << std::endl;
-    // Receive password
-    while (true) {    
-        bytes_read = recv(client_fd, buffer, BUFFER_SIZE, 0);
-        if (bytes_read == -1) {
-            if (errno == EWOULDBLOCK || errno == EAGAIN) {
-                continue; // No data available yet, continue waiting
-            } else {
-                std::cerr << "Failed to receive password" << std::endl;
-                close(client_fd);
-                return;
-            }
-        }
-        if (bytes_read == 0) {
-            std::cerr << "Connection closed" << std::endl;
-            close(client_fd);
-            return;
-        }
-        buffer[bytes_read] = '\0';
-        password = buffer;
-        break; // Password received successfully
-    }
-
-    if (username == "admin" && password == "password") {
-        const char *auth_success = "Authentication successful\n";
-        send(client_fd, auth_success, strlen(auth_success), 0);
-        std::cout << auth_success << std::endl;
-    } else {
-        const char *auth_failed = "Authentication failed\n";
-        send(client_fd, auth_failed, strlen(auth_failed), 0);
-        std::cout << auth_failed << std::endl;
-        close(client_fd);
-        return;
-    }
-
-    std::cout << "Waiting for commands from client..." << std::endl;
-    // Command execution loop
-    while (true) {
-        std::string command;
-        
-        // Receive command from client
-        while (true) {
-            bytes_read = recv(client_fd, buffer, BUFFER_SIZE, 0);
-            if (bytes_read == -1) {
-                if (errno == EWOULDBLOCK || errno == EAGAIN) {
-                    continue;
-                } else {
-                    std::cerr << "Failed to receive command or connection closed" << std::endl;
-                    close(client_fd);
-                    return;
-                }
-            }
-            if (bytes_read == 0) {
-                std::cerr << "Connection closed" << std::endl;
-                close(client_fd);
-                return;
-            }
-            buffer[bytes_read] = '\0';
-            command += buffer;
-            break; 
-        }
-
-        // Check if command is received
-        if (command.empty()) {
-            continue; // No command received, wait for more data
-        }
-
-        std::cout << "Received command - " << command << std::endl;
-
-        if (strcmp(buffer, "DISCONNECT") == 0) {
-            std::cout << "Client has requested to disconnect." << std::endl;
-            break; // Exit the loop and close the connection
-        }  
-
-        // Execute the command and send the result back to the client
-        std::cout << "Executing command " << command;
-        std::string result = executeCommand(command);
-        send(client_fd, result.c_str(), result.size(), 0);
-    }
-
-    close(client_fd);
+    close(client_fd); // Close the client connection
+    std::cout << "Connection closed with client." << std::endl;
 }
 
 int main() {
-    // Create thread pool with 4 threads
-    ThreadPool pool(4);
-
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd == -1) {
-        std::cerr << "Failed to create socket" << std::endl;
-        return -1;
-    }
-
-    sockaddr_in server_addr{};
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port = htons(PORT);
-
-    if (bind(server_fd, (sockaddr*)&server_addr, sizeof(server_addr)) == -1) {
-        std::cerr << "Bind failed" << std::endl;
-        close(server_fd);
-        return -1;
-    }
-
-    if (listen(server_fd, BACKLOG) == -1) {
-        std::cerr << "Listen failed" << std::endl;
-        close(server_fd);
-        return -1;
-    }
-
-    std::cout << "Server started and listening on port " << PORT << std::endl;
-
     int epoll_fd = epoll_create1(0);
     if (epoll_fd == -1) {
         std::cerr << "Epoll create failed" << std::endl;
-        close(server_fd);
         return -1;
     }
 
+    // Create listening socket
+    int listen_fd = createSocket();
+    if (listen_fd == -1) {
+        return -1;
+    }
+
+    std::cout << "server started at PORT " << PORT << std::endl;
+
+    // Setup CTPL Thread Pool with 4 threads
+    ctpl::thread_pool pool(8);
+
+    // Register listening socket with epoll
     epoll_event event{}, events[MAX_EVENTS];
-    event.data.fd = server_fd;
-    event.events = EPOLLIN;
-
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &event) == -1) {
-        std::cerr << "Epoll ctl failed" << std::endl;
-        close(server_fd);
-        close(epoll_fd);
+    event.events = EPOLLIN | EPOLLET | EPOLLOUT ;
+    event.data.fd = listen_fd;
+    
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listen_fd, &event) == -1) {
+        std::cerr << "Failed to add listen socket to epoll" << std::endl;
+        close(listen_fd);
         return -1;
     }
 
-    while (true) {
-        int n_fds = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
-        for (int i = 0; i < n_fds; i++) {
-            if (events[i].data.fd == server_fd) {
-                // Accept new client connection
-                int client_fd = accept(server_fd, nullptr, nullptr);
-                if (client_fd == -1) {
-                    std::cerr << "Accept failed" << std::endl;
-                    continue;
-                }
-                std::cout << "Server accepted new client" << std::endl;
+    // Dedicated thread to monitor epoll events
+    std::thread epoll_thread([&]() {
+        while (true) {
+            int n_fds = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
+            for (int i = 0; i < n_fds; i++) {
+                if (events[i].data.fd == listen_fd) {
+                    // New client connection
+                    int client_fd = accept(listen_fd, nullptr, nullptr);
+                    if (client_fd != -1) {
+                        std::cout << "New client connected" << std::endl;
+                        setNonBlocking(client_fd);
 
-                // Set client socket to non-blocking
-                setNonBlocking(client_fd);
+                        // Register the new client socket for EPOLLIN
+                        epoll_event client_event{};
+                        client_event.events = EPOLLIN | EPOLLET | EPOLLOUT; // Edge-triggered
+                        client_event.data.fd = client_fd;
 
-                // Add client socket to epoll
-                event.data.fd = client_fd;
-                event.events = EPOLLIN | EPOLLET; // Edge-triggered
-                if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &event) == -1) {
-                    std::cerr << "Epoll ctl add failed" << std::endl;
-                    close(client_fd);
-                    continue;
+                        if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &client_event) == -1) {
+                            std::cerr << "Failed to add client socket to epoll" << std::endl;
+                            close(client_fd);
+                        }
+                    } else {
+                        std::cerr << "Accept failed" << std::endl;
+                    }
+                } else {
+                    // Existing client has sent data, handle in a separate thread from the pool
+                    int client_fd = events[i].data.fd;
+                    if (events[i].events & EPOLLIN) {
+                        pool.push([client_fd](int id) {
+                            handleClient(client_fd);
+                        });
+                    }
                 }
-            } else {
-                // Handle existing client connection
-                int client_fd = events[i].data.fd;
-                pool.enqueue([client_fd] { handleClient(client_fd); });
             }
         }
-    }
+    });
 
-    close(server_fd);
+    epoll_thread.join();
+    close(listen_fd);
     close(epoll_fd);
     return 0;
 }

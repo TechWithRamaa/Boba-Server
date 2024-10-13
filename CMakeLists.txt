@@ -14,8 +14,8 @@ add_executable(BobaServer BobaServer.cpp)
 # Link the pthread library
 target_link_libraries(BobaServer pthread)
 
-# Optional: Set include directories if you have headers
-# target_include_directories(BobaServer PRIVATE include/)
+# Specify the include directory where ctpl_stl.h is located
+target_include_directories(BobaServer PRIVATE ${CMAKE_SOURCE_DIR}/include)
 
 # Optional: Compiler flags for optimization/debugging
 if(CMAKE_BUILD_TYPE MATCHES Debug)
